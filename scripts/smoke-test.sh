@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+ROOT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 ENV_FILE=${ENV_FILE:-"$ROOT_DIR/deploy/.env"}
 
 if [ ! -f "$ENV_FILE" ]; then
@@ -19,4 +19,3 @@ curl --fail --silent --show-error "http://127.0.0.1:$FRONTEND_PORT/api/health" >
 curl --fail --silent --show-error "http://127.0.0.1:$BACKEND_PORT/health" >/dev/null
 
 echo "Smoke test passed: UI and both health-check paths are reachable."
-

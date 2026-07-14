@@ -1,123 +1,155 @@
 # OJ Training Data Manager
 
-OJ Training Data Manager 是一个面向个人部署和小团队使用的独立 OJ 训练数据管理项目。它负责 Codeforces、AtCoder 数据采集，ODS/DWD/DWM/DWS 数仓加工，训练查询，成员与 OJ handle 管理，以及手动和定时采集。
+OJ Training Data Manager 是一个面向个人部署和小团队的独立 OJ 训练数据平台。它把 Codeforces、AtCoder 的提交数据采集、分层加工、公开查询和成员管理放进一个可独立运行的项目中。
 
-本项目从空库开始，不依赖、不连接也不迁移任何其他项目的数据、数据库或 Docker volume。
+项目只认 `username`，从空库开始，不依赖、不连接也不迁移其他系统的数据、数据库或 Docker volume。
 
-## 功能与边界
+## 它解决什么问题
 
-- 成员身份只保留 `username`，不包含 nickname、登录账号、角色或个人密码。
-- 所有 `GET` 查询完全公开，包括 handle、采集游标和任务详情。
-- 只有 `GET`、`HEAD`、`OPTIONS` 公开；其他请求全部必须携带 `X-Operation-Password`。
-- 不存在登录、JWT、session 或权限角色；全局操作密码由部署配置生效，修改后重启 API。
-- 支持 Codeforces 和 AtCoder 提交采集、数仓刷新与统计查询。
-- 前端沿用原 Training 工作台的页面结构和样式，五个入口直接平铺在 52px 黑色顶栏。
-- 自动采集和 AtCoder 题目元数据 bootstrap 默认全部关闭，必须由部署者显式启用。
+OJ API 适合查询单个用户，却不适合长期维护团队训练数据：重复抓取成本高、历史数据容易丢失、不同 OJ 的字段不一致，也很难直接回答“某人最近做了什么题”“某题有哪些人首次通过”等问题。
 
-## 目录
+本项目把这件事拆成稳定的数据链路：
 
 ```text
-backend/                 Java 21 / Spring Boot 多模块后端
-  common-core/           数仓 SQL 任务编排与执行内核
-  training-data-common/  公共领域、数仓 SQL、采集、存储和查询能力
-  training-data-codeforces/ Codeforces 数据源适配
-  training-data-atcoder/ AtCoder 数据源适配
-  training-api/          唯一可运行 HTTP 服务
-frontend/                Vue 3 / Vite 前端和 Nginx 网关
-deploy/                  独立的三服务 Compose 部署
-scripts/                 部署配置检查和运行后冒烟检查
+Codeforces / AtCoder
+        │
+        ▼
+ODS 原始提交层
+        │
+        ▼
+DWD 统一明细层
+        │
+        ├──────────────► DWM 成员-题目首次 AC
+        │
+        └──────────────► DWS 成员每日难度统计
+                              │
+                              ▼
+                     公开查询 API 与前端
 ```
 
-运行时只有三个服务：MySQL 8.4 `training-db`、内部端口为 8190 的 `training-api`，以及默认仅绑定宿主机回环地址 3100 端口的 `frontend`。浏览器请求 `/api/**` 时由 Nginx 转发到 API。
+- **ODS** 保存接近来源结构的原始提交，负责去重和追溯。
+- **DWD** 把不同 OJ 的字段整理为统一提交模型。
+- **DWM** 保存成员与题目的首次 AC 关系，支持首次通过查询。
+- **DWS** 保存按成员、日期、难度聚合的统计，避免每次查询重新扫描全部提交。
+- 数仓刷新使用可重复执行的 upsert，同一批数据重复加工不会无限制造重复记录。
 
-## 快速启动
+## 核心设计
 
-需要 Docker Engine 或 Docker Desktop，并支持 Docker Compose v2。
+### 独立部署
 
-当前目录包含一个仅供本机验收且不纳入 Git 的 `deploy/.env`，密码使用本次部署生成的随机值。直接启动：
+运行时只有三个容器：
+
+```text
+浏览器 ──► frontend (Nginx + Vue 3) ──► training-api (Spring Boot)
+                                                   │
+                                                   ▼
+                                            training-db (MySQL)
+```
+
+Nginx 在一个入口同时提供前端和 `/api/**` 代理；API 是唯一 HTTP 业务入口；MySQL volume 只属于本项目。
+
+### 简化鉴权
+
+- `GET`、`HEAD`、`OPTIONS` 完全公开，任何人都能查询成员、游标、统计和任务状态。
+- `POST`、`PUT`、`PATCH`、`DELETE` 必须携带 `X-Operation-Password`。
+- 不存在登录、JWT、session、角色、nickname 或个人密码。
+- 操作密码只来自部署端的 `TRAINING_OPERATION_PASSWORD`，前端仅在单次确认框和请求调用栈中临时持有。
+
+明文密码指请求凭据格式简单，不代表可以使用明文网络传输。公网部署必须在服务前配置 HTTPS。
+
+### 全量与增量采集
+
+每个 `username + OJ` 独立保存 `lastCollectedAt` 游标：
+
+- 没有成功游标时是首次采集，有效倒退小时强制为 `0`，底层从历史起点全量抓取。
+- 已有游标时从 `lastCollectedAt - lookback` 开始，用重叠窗口吸收来源 API 的延迟数据。
+- 混合批次按成员分别计算窗口，首次成员使用 `0`，已有游标成员使用填写值。
+- 只有成功采集才推进游标；失败不会让下一次采集跳过数据。
+
+### 数据一致性
+
+成员 handle 变更、远端抓取、ODS 写入和数仓刷新不会被当成一个超长数据库事务。系统通过 OJ fence、generation 和二次复核保证抓取期间 handle 被修改或删除时，旧数据不会重新写回。
+
+修改或删除 handle 会同步清理关联的 ODS、DWD、DWM、DWS 数据并重置采集状态。手动任务进度保存在 API 进程内存中，重启后任务历史消失，但持久化数据和游标不会丢失。
+
+## 一键部署
+
+需要 macOS 或 Linux、Docker Engine/Docker Desktop，以及 Docker Compose v2。
 
 ```bash
-docker compose --env-file deploy/.env -f deploy/docker-compose.yml up -d --build
-docker compose --env-file deploy/.env -f deploy/docker-compose.yml ps
-./scripts/smoke-test.sh
+git clone https://github.com/ZvezdyUTO/oj-training-data-manager.git
+cd oj-training-data-manager
+./scripts/quick-start.sh
 ```
 
-浏览器打开 [http://localhost:3100](http://localhost:3100)。API 也会仅绑定到宿主机回环地址 [http://127.0.0.1:8190/health](http://127.0.0.1:8190/health)，不会直接暴露给局域网。
+脚本只在 `deploy/.env` 不存在时生成数据库密码、root 密码和全局操作密码；已有配置不会被覆盖。随后它会校验 Compose、构建并等待三个服务健康，再执行冒烟检查。
 
-查看日志或停止服务：
+启动后打开 [http://localhost:3100](http://localhost:3100)。需要修改数据时，从本机 `deploy/.env` 获取 `TRAINING_OPERATION_PASSWORD`；该文件已被 Git 和 Docker 构建上下文排除，请勿上传或分享。
 
-```bash
-docker compose --env-file deploy/.env -f deploy/docker-compose.yml logs -f training-api
-docker compose --env-file deploy/.env -f deploy/docker-compose.yml down
-```
+## 手动部署与配置
 
-`down` 不会删除数据库。只有明确需要清空本项目数据时才执行 `down -v`；该命令会删除独立的数据库与日志 volume，其中数据库无法恢复。
-
-## 正式部署配置
-
-先从模板创建本地配置，并至少更换数据库密码、root 密码和全局操作密码：
+需要自定义端口、volume 名称或自动采集计划时，先创建配置：
 
 ```bash
 cp deploy/.env.example deploy/.env
 chmod 600 deploy/.env
+# 编辑 deploy/.env，至少替换三个 change-me 密码
 ./scripts/compose-config.sh
+docker compose --env-file deploy/.env -f deploy/docker-compose.yml up -d --build --wait
+./scripts/smoke-test.sh
 ```
 
-`deploy/.env` 已被 `.gitignore` 排除。不要把真实密码提交到 Git、写入镜像或发到前端构建变量中。`TRAINING_OPERATION_PASSWORD` 更新后需要重建或重启 `training-api`：
+默认只监听本机：前端为 `127.0.0.1:3100`，API 为 `127.0.0.1:8190`。所有自动采集和 AtCoder 题目元数据 bootstrap 默认关闭，只有显式修改 `.env` 才会启用。
+
+查看状态、日志和停止服务：
 
 ```bash
-docker compose --env-file deploy/.env -f deploy/docker-compose.yml up -d --no-deps --force-recreate training-api
+docker compose --env-file deploy/.env -f deploy/docker-compose.yml ps
+docker compose --env-file deploy/.env -f deploy/docker-compose.yml logs -f training-api
+docker compose --env-file deploy/.env -f deploy/docker-compose.yml down
 ```
 
-操作密码以明文请求头形式校验，因此公网或不可信网络部署必须在本项目 Nginx 之前配置 HTTPS 终止层。前端只在修改确认框中临时持有密码，不应把它保存到 localStorage、sessionStorage、Cookie 或 URL。
+`down` 不删除数据库；`down -v` 会永久删除本项目数据库与日志 volume，只应在明确需要清空数据时使用。
 
-## HTTP 使用约定
+## 使用流程
 
-查询请求无需任何凭据：
+1. 打开“成员管理”，输入 `username`、Codeforces/AtCoder handle，并决定是否参与自动采集。
+2. 修改操作需要输入全局操作密码；查询不需要密码。
+3. 打开“数据采集”，选择 OJ 并执行单人或全部采集。首次成员会显示不可编辑的倒退小时 `0`。
+4. 在多人、单人或题目页面查询统计、提交明细和首次 AC。
+
+浏览器和 API 共用同一入口。例如公开健康检查：
 
 ```bash
 curl http://localhost:3100/api/health
 ```
 
-任何修改请求都必须提供操作密码：
+写请求必须显式携带当次操作密码：
 
 ```bash
-curl -X POST http://localhost:3100/api/example \
+curl -X POST http://localhost:3100/api/members/batch \
   -H 'Content-Type: application/json' \
-  -H 'X-Operation-Password: <你的 TRAINING_OPERATION_PASSWORD>' \
-  --data '{}'
+  -H 'X-Operation-Password: <TRAINING_OPERATION_PASSWORD>' \
+  --data '{"members":[{"username":"alice","needCollect":true,"handles":{"CODEFORCES":"alice"}}]}'
 ```
 
-上例 `/api/example` 只用于展示请求头合同，请以实际页面或 API 文档中的写接口替换。未提供或密码错误时，API 应返回 `401 Unauthorized`；查询接口不得要求这个请求头。
+## 项目结构
 
-## 数据、采集与任务状态
-
-- Flyway 在全新 MySQL 库中创建最终态训练表，不导入历史数据。
-- 成员、OJ handle、提交、数仓结果和 `lastCollectedAt` 游标持久化在 MySQL volume 中。
-- 某个成员/OJ 没有游标时，手动任务会把该成员的有效 lookback 强制为 `0` 并覆盖全部历史；混合批次中只有已有游标的成员使用填写的倒退小时。后续从上次成功游标减去 lookback 开始，且只有整次成功才推进游标。
-- 修改或删除 handle 时，同一业务操作会清理该绑定关联的 ODS/DWD/DWM/DWS 数据并重置采集状态。
-- 手动采集任务的运行状态与最近任务记录只保存在 `training-api` 进程内存；容器重启后记录消失，但已经落库的数据和游标不受影响。
-- `.env` 中的所有定时采集开关默认是 `false`。启用前应确认外部 API 配额、采集频率和主机资源。
-
-## 日志与排障
-
-API 将日志写到项目自己的 `oj-training-data-manager_training-api-logs` Docker volume，容器内路径是 `/app/logs`：
-
-- `combined.log`：综合运行日志。
-- `error.log`：错误日志；错误事件应包含稳定的 `errorCode`。
-
-日志不得记录 `X-Operation-Password`、操作密码、数据库密码或其他凭据。日常优先使用 `docker compose logs` 查看，常用检查：
-
-```bash
-./scripts/compose-config.sh
-docker compose --env-file deploy/.env -f deploy/docker-compose.yml ps
-docker compose --env-file deploy/.env -f deploy/docker-compose.yml logs --tail=200 training-db training-api frontend
-./scripts/smoke-test.sh
+```text
+backend/
+  common-core/              数仓 SQL DAG 与执行内核
+  training-data-common/     跨 OJ 领域、采集游标、查询和持久化
+  training-data-codeforces/ Codeforces 来源与 ODS 适配
+  training-data-atcoder/    AtCoder 来源、题目元数据与 ODS 适配
+  training-api/             唯一可运行 Spring Boot 服务
+frontend/                   Vue 3 前端与 Nginx 网关
+deploy/                     三服务 Docker Compose 部署
+scripts/                    一键部署、配置检查和冒烟检查
 ```
 
-更完整的部署配置说明见 [`deploy/README.md`](deploy/README.md)。
+更完整的部署参数见 [`deploy/README.md`](deploy/README.md)，各模块边界见对应目录的 `README.md`。
 
-## 本地验证
+## 开发验证
 
 ```bash
 mvn clean test
@@ -127,5 +159,3 @@ pnpm --dir frontend test
 pnpm --dir frontend build
 ./scripts/compose-config.sh
 ```
-
-不执行 Git 提交或推送，除非项目所有者明确下令；MR 标题和描述使用中文。
