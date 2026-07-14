@@ -1,0 +1,117 @@
+.standalone-training-nav {
+  display: flex;
+  align-items: stretch;
+}
+
+.blog-topbar-inner > nav a.is-active {
+  background: rgb(255 255 255 / 9%);
+  color: #fff;
+}
+
+.blog-topbar-inner > nav a.is-active::after {
+  position: absolute;
+  bottom: -7px;
+  left: 50%;
+  width: 0;
+  height: 0;
+  border-top: 7px solid #343638;
+  border-right: 8px solid transparent;
+  border-left: 8px solid transparent;
+  content: "";
+  transform: translateX(-50%);
+}
+
+.standalone-theme-toggle {
+  margin-left: auto;
+}
+
+.members-page {
+  display: grid;
+  gap: 16px;
+  width: 100%;
+}
+
+.members-page .create-user-row {
+  grid-template-columns: minmax(180px, 1.2fr) minmax(180px, 1fr) minmax(180px, 1fr) minmax(130px, .65fr) 42px;
+}
+
+.members-page .admin-user-edit-grid {
+  grid-template-columns: repeat(4, minmax(150px, 1fr));
+}
+
+.member-management-header .refresh-members-button {
+  margin-left: auto;
+}
+
+.operation-password-form {
+  display: grid;
+  grid-column: 1 / -1;
+  gap: 10px;
+}
+
+.password-dialog {
+  --admin-border: #d1bcc2;
+  --admin-text: #3d2d31;
+}
+
+.operation-password-form label {
+  display: grid;
+  gap: 7px;
+  color: #554745;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.operation-password-form input {
+  width: 100%;
+  min-height: 42px;
+  border: 1px solid var(--admin-border, #d1bcc2);
+  border-radius: var(--radius-control);
+  background: #fff;
+  color: var(--text);
+  padding: 0 12px;
+}
+
+.operation-password-form input:focus {
+  border-color: var(--navy-ring);
+  box-shadow: 0 0 0 3px rgb(156 89 104 / 14%);
+  outline: 0;
+}
+
+.operation-password-form > small {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.operation-password-form .dialog-error {
+  margin: 0;
+  color: var(--red);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+html.dark .operation-password-form label,
+html.dark .operation-password-form > small {
+  color: var(--muted);
+}
+
+html.dark .operation-password-form input {
+  border-color: var(--border);
+  background: var(--surface-subtle);
+  color: var(--text);
+}
+
+html.dark .password-dialog {
+  --admin-border: #765136;
+  --admin-text: #f2e8dc;
+}
+
+@media (max-width: 1279px) {
+  .site-name {
+    font-size: 18px;
+  }
+
+  .blog-topbar-inner > nav a {
+    padding: 0 10px;
+  }
+}

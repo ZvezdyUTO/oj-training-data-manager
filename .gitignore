@@ -1,0 +1,21 @@
+.DS_Store
+.idea/
+.vscode/
+
+# Local-only configuration and runtime data
+deploy/.env
+logs/
+
+# Java build output
+target/
+*.log
+
+# Frontend dependencies and build output
+frontend/node_modules/
+frontend/dist/
+
+# Local test artifacts
+coverage/
+playwright-report/
+test-results/
+

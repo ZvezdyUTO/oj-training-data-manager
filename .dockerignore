@@ -1,0 +1,19 @@
+.git
+.gitignore
+.DS_Store
+.idea
+.vscode
+
+# Never send local credentials or runtime logs to the Docker daemon.
+deploy/.env
+logs
+*.log
+
+# Rebuild artifacts inside their dedicated image stages.
+**/target
+frontend/node_modules
+frontend/dist
+coverage
+playwright-report
+test-results
+

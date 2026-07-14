@@ -1,0 +1,72 @@
+package com.ojtraining.manager.trainingdata.atcoder.config;
+
+import com.ojtraining.manager.trainingdata.atcoder.app.AtcoderProblemListCollectionService;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.boot.ApplicationArguments;
+import org.springframework.boot.ApplicationRunner;
+import org.springframework.jdbc.core.namedparam.NamedParameterJdbcOperations;
+import org.springframework.stereotype.Component;
+
+import java.util.Map;
+
+@Component
+public class AtcoderProblemListBootstrapRunner implements ApplicationRunner {
+    private static final String PROBLEM_LIST_BOOTSTRAP_FAILED_ERROR_CODE =
+            "ATCODER_PROBLEM_LIST_BOOTSTRAP_FAILED";
+    private static final String PROBLEM_COUNT_SQL = "select count(*) from ods_atcoder__problem";
+    private static final String PROBLEM_MODEL_COUNT_SQL = "select count(*) from ods_atcoder__problem_model";
+    private static final Logger log = LoggerFactory.getLogger(AtcoderProblemListBootstrapRunner.class);
+
+    private final AtcoderProblemListCollectorProperties properties;
+    private final AtcoderProblemListCollectionService collectionService;
+    private final NamedParameterJdbcOperations jdbcOperations;
+
+    public AtcoderProblemListBootstrapRunner(
+            AtcoderProblemListCollectorProperties properties,
+            AtcoderProblemListCollectionService collectionService,
+            NamedParameterJdbcOperations jdbcOperations
+    ) {
+        this.properties = properties;
+        this.collectionService = collectionService;
+        this.jdbcOperations = jdbcOperations;
+    }
+
+    @Override
+    public void run(ApplicationArguments args) {
+        try {
+            if (!properties.bootstrapOnStartup()) {
+                log.info("AtCoder problem-list startup bootstrap is disabled");
+                return;
+            }
+            if (properties.bootstrapOnlyWhenEmpty() && existingProblemCount() > 0 && existingProblemModelCount() > 0) {
+                log.info("AtCoder problem-list startup bootstrap skipped because ODS problem metadata tables are not empty");
+                return;
+            }
+            var result = collectionService.collectProblems();
+            log.info(
+                    "AtCoder problem metadata startup bootstrap finished, problemBatchId={}, problemModelBatchId={}, writtenRows={}",
+                    result.problemResult().batchId(),
+                    result.problemModelResult().batchId(),
+                    result.writtenRows()
+            );
+        } catch (JsonProcessingException ex) {
+            log.error("AtCoder problem-list startup bootstrap failed, errorCode={}",
+                    PROBLEM_LIST_BOOTSTRAP_FAILED_ERROR_CODE, ex);
+        } catch (RuntimeException ex) {
+            log.error("AtCoder problem-list startup bootstrap failed, errorCode={}",
+                    PROBLEM_LIST_BOOTSTRAP_FAILED_ERROR_CODE, ex);
+        }
+    }
+
+    private int existingProblemCount() {
+        Integer count = jdbcOperations.queryForObject(PROBLEM_COUNT_SQL, Map.of(), Integer.class);
+        return count == null ? 0 : count;
+    }
+
+    private int existingProblemModelCount() {
+        Integer count = jdbcOperations.queryForObject(PROBLEM_MODEL_COUNT_SQL, Map.of(), Integer.class);
+        return count == null ? 0 : count;
+    }
+}

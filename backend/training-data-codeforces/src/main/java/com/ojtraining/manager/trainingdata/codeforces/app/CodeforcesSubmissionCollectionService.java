@@ -1,0 +1,133 @@
+package com.ojtraining.manager.trainingdata.codeforces.app;
+
+import com.ojtraining.manager.trainingdata.common.app.account.TrainingUserDirectory;
+import com.ojtraining.manager.trainingdata.common.collector.OjCollectionRequestExecutor;
+import com.ojtraining.manager.trainingdata.common.collector.OjHandleAccountCollectionHandleResolver;
+import com.ojtraining.manager.trainingdata.common.collector.OjSubmissionCollectionService;
+import com.ojtraining.manager.trainingdata.common.collector.lock.OjCollectionConsistencyGuard;
+import com.ojtraining.manager.trainingdata.common.collector.dispatch.OjRecentSubmissionCollector;
+import com.ojtraining.manager.trainingdata.common.collector.result.OjSubmissionCollectionResult;
+import com.ojtraining.manager.trainingdata.common.domain.oj.value.OjNames;
+import com.ojtraining.manager.trainingdata.codeforces.config.CodeforcesCollectorProperties;
+import com.ojtraining.manager.trainingdata.codeforces.domain.CodeforcesSubmissionSourceClient;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+
+import java.time.Clock;
+import java.time.Duration;
+
+public class CodeforcesSubmissionCollectionService implements OjRecentSubmissionCollector {
+    private final OjSubmissionCollectionService delegate;
+
+    public CodeforcesSubmissionCollectionService(
+            TrainingUserDirectory handleAccountService,
+            CodeforcesSubmissionSourceClient sourceClient,
+            CodeforcesOdsSubmissionIngestService ingestService,
+            ObjectMapper objectMapper,
+            CodeforcesCollectorProperties properties
+    ) {
+        this(
+                handleAccountService,
+                sourceClient,
+                ingestService,
+                objectMapper,
+                properties,
+                OjCollectionConsistencyGuard.passthrough()
+        );
+    }
+
+    public CodeforcesSubmissionCollectionService(
+            TrainingUserDirectory handleAccountService,
+            CodeforcesSubmissionSourceClient sourceClient,
+            CodeforcesOdsSubmissionIngestService ingestService,
+            ObjectMapper objectMapper,
+            CodeforcesCollectorProperties properties,
+            OjCollectionConsistencyGuard consistencyGuard
+    ) {
+        this(
+                handleAccountService,
+                sourceClient,
+                ingestService,
+                objectMapper,
+                properties.pageSize(),
+                properties.maxRequestAttempts(),
+                properties.requestInterval(),
+                Clock.systemUTC(),
+                duration -> Thread.sleep(duration.toMillis()),
+                consistencyGuard
+        );
+    }
+
+    public CodeforcesSubmissionCollectionService(
+            TrainingUserDirectory handleAccountService,
+            CodeforcesSubmissionSourceClient sourceClient,
+            CodeforcesOdsSubmissionIngestService ingestService,
+            ObjectMapper objectMapper,
+            int pageSize,
+            int maxRequestAttempts,
+            Duration requestInterval,
+            Clock clock,
+            OjCollectionRequestExecutor.SleepStrategy sleepStrategy
+    ) {
+        this(
+                handleAccountService,
+                sourceClient,
+                ingestService,
+                objectMapper,
+                pageSize,
+                maxRequestAttempts,
+                requestInterval,
+                clock,
+                sleepStrategy,
+                OjCollectionConsistencyGuard.passthrough()
+        );
+    }
+
+    public CodeforcesSubmissionCollectionService(
+            TrainingUserDirectory handleAccountService,
+            CodeforcesSubmissionSourceClient sourceClient,
+            CodeforcesOdsSubmissionIngestService ingestService,
+            ObjectMapper objectMapper,
+            int pageSize,
+            int maxRequestAttempts,
+            Duration requestInterval,
+            Clock clock,
+            OjCollectionRequestExecutor.SleepStrategy sleepStrategy,
+            OjCollectionConsistencyGuard consistencyGuard
+    ) {
+        this.delegate = new OjSubmissionCollectionService(
+                new OjHandleAccountCollectionHandleResolver(handleAccountService),
+                new CodeforcesSubmissionCollectionAdapter(sourceClient, ingestService, objectMapper, pageSize),
+                maxRequestAttempts,
+                requestInterval,
+                clock,
+                sleepStrategy,
+                consistencyGuard
+        );
+    }
+
+    @Override
+    public String ojName() {
+        return OjNames.CODEFORCES;
+    }
+
+    @Override
+    public OjSubmissionCollectionResult collectRecentWindowForConfiguredHandles(
+            Duration lookback
+    ) throws JsonProcessingException {
+        return delegate.collectRecentWindowForConfiguredHandles(OjNames.CODEFORCES, lookback);
+    }
+
+    @Override
+    public OjSubmissionCollectionResult collectRecentWindowForUsername(
+            String username,
+            Duration lookback
+    ) throws JsonProcessingException {
+        return delegate.collectRecentWindowForUsername(
+                OjNames.CODEFORCES,
+                username,
+                lookback
+        );
+    }
+
+}

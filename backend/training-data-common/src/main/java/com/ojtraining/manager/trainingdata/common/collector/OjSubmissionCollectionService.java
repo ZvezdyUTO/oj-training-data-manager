@@ -1,0 +1,369 @@
+package com.ojtraining.manager.trainingdata.common.collector;
+
+import com.ojtraining.manager.trainingdata.common.collector.result.OjHandleCollectionOutcome;
+import com.ojtraining.manager.trainingdata.common.collector.result.OjSubmissionCollectionHandleResult;
+import com.ojtraining.manager.trainingdata.common.collector.result.OjSubmissionCollectionHandleStatus;
+import com.ojtraining.manager.trainingdata.common.collector.result.OjSubmissionCollectionResult;
+import com.ojtraining.manager.trainingdata.common.collector.result.OjSubmissionCollectionWriteResult;
+import com.ojtraining.manager.trainingdata.common.collector.lock.OjCollectionConsistencyGuard;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+import java.util.Objects;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import static com.ojtraining.manager.trainingdata.common.support.Texts.requireText;
+
+public class OjSubmissionCollectionService {
+    private static final Logger log = LoggerFactory.getLogger(OjSubmissionCollectionService.class);
+    private static final String ALREADY_RUNNING_ERROR_CODE = "OJ_COLLECTOR_ALREADY_RUNNING";
+
+    private final OjCollectionHandleResolver handleResolver;
+    private final OjSubmissionCollectionAdapter adapter;
+    private final int maxRequestAttempts;
+    private final Duration requestInterval;
+    private final Clock clock;
+    private final OjCollectionRequestExecutor.SleepStrategy sleepStrategy;
+    private final OjCollectionConsistencyGuard consistencyGuard;
+    private final AtomicBoolean running = new AtomicBoolean(false);
+
+    public OjSubmissionCollectionService(
+            OjCollectionHandleResolver handleResolver,
+            OjSubmissionCollectionAdapter adapter,
+            int maxRequestAttempts,
+            Duration requestInterval,
+            Clock clock,
+            OjCollectionRequestExecutor.SleepStrategy sleepStrategy
+    ) {
+        this(
+                handleResolver,
+                adapter,
+                maxRequestAttempts,
+                requestInterval,
+                clock,
+                sleepStrategy,
+                OjCollectionConsistencyGuard.passthrough()
+        );
+    }
+
+    public OjSubmissionCollectionService(
+            OjCollectionHandleResolver handleResolver,
+            OjSubmissionCollectionAdapter adapter,
+            int maxRequestAttempts,
+            Duration requestInterval,
+            Clock clock,
+            OjCollectionRequestExecutor.SleepStrategy sleepStrategy,
+            OjCollectionConsistencyGuard consistencyGuard
+    ) {
+        this.handleResolver = Objects.requireNonNull(handleResolver, "handleResolver must not be null");
+        this.adapter = Objects.requireNonNull(adapter, "adapter must not be null");
+        this.maxRequestAttempts = maxRequestAttempts;
+        this.requestInterval = requestInterval == null || requestInterval.isNegative()
+                ? Duration.ZERO
+                : requestInterval;
+        this.clock = Objects.requireNonNull(clock, "clock must not be null");
+        this.sleepStrategy = Objects.requireNonNull(sleepStrategy, "sleepStrategy must not be null");
+        this.consistencyGuard = Objects.requireNonNull(consistencyGuard, "consistencyGuard must not be null");
+    }
+
+    public OjSubmissionCollectionResult collectRecentWindowForConfiguredHandles(
+            Duration lookback
+    ) throws JsonProcessingException {
+        return collectRecentWindowForConfiguredHandles(adapter.defaultOjName(), lookback);
+    }
+
+    public OjSubmissionCollectionResult collectRecentWindowForConfiguredHandles(
+            String ojName,
+            Duration lookback
+    ) throws JsonProcessingException {
+        String normalizedOjName = requireOjName(ojName);
+        return collectRecentWindow(
+                normalizedOjName,
+                lookback,
+                () -> normalizeHandles(handleResolver.listHandlesForCollection(normalizedOjName))
+        );
+    }
+
+    public OjSubmissionCollectionResult collectRecentWindowForUsername(
+            String username,
+            Duration lookback
+    ) throws JsonProcessingException {
+        return collectRecentWindowForUsername(adapter.defaultOjName(), username, lookback);
+    }
+
+    public OjSubmissionCollectionResult collectRecentWindowForUsername(
+            String ojName,
+            String username,
+            Duration lookback
+    ) throws JsonProcessingException {
+        String normalizedOjName = requireOjName(ojName);
+        String normalizedUsername = requireText(username, "username");
+        return collectRecentWindow(normalizedOjName, lookback, () -> List.of(requireText(
+                handleResolver.getHandleByUsername(normalizedOjName, normalizedUsername),
+                "handle"
+        )));
+    }
+
+    private OjSubmissionCollectionResult collectRecentWindow(
+            String ojName,
+            Duration lookback,
+            CollectionHandleSupplier handleSupplier
+    ) throws JsonProcessingException {
+        Duration normalizedLookback = requireNonNegativeDuration(lookback, "lookback");
+        Instant windowEndExclusive = clock.instant();
+        return collectWindow(
+                ojName,
+                normalizedLookback,
+                windowEndExclusive,
+                handleSupplier
+        );
+    }
+
+    private OjSubmissionCollectionResult collectWindow(
+            String ojName,
+            Duration lookback,
+            Instant windowEndExclusive,
+            CollectionHandleSupplier handleSupplier
+    ) throws JsonProcessingException {
+        Instant fallbackWindowStartInclusive = overlapWindowStart(windowEndExclusive, lookback);
+        requireWindow(fallbackWindowStartInclusive, windowEndExclusive);
+        if (!running.compareAndSet(false, true)) {
+            log.warn(
+                    "OJ submission collection skipped, errorCode={}, ojName={}",
+                    ALREADY_RUNNING_ERROR_CODE,
+                    ojName
+            );
+            return OjSubmissionCollectionResult.skipped(
+                    ojName,
+                    fallbackWindowStartInclusive,
+                    windowEndExclusive,
+                    adapter.displayName(ojName) + " submission collection is already running"
+            );
+        }
+        try {
+            return doCollectWindow(
+                    ojName,
+                    lookback,
+                    fallbackWindowStartInclusive,
+                    windowEndExclusive,
+                    handleSupplier
+            );
+        } finally {
+            running.set(false);
+        }
+    }
+
+    private OjSubmissionCollectionResult doCollectWindow(
+            String ojName,
+            Duration lookback,
+            Instant fallbackWindowStartInclusive,
+            Instant windowEndExclusive,
+            CollectionHandleSupplier handleSupplier
+    ) throws JsonProcessingException {
+        OjCollectionConsistencyGuard.CollectionSnapshot collectionSnapshot = consistencyGuard.snapshot(
+                ojName,
+                () -> normalizeHandles(handleSupplier.listHandles()).stream()
+                        .map(handle -> new OjCollectionConsistencyGuard.CollectionTarget(
+                                handle,
+                                handleResolver.getLastCollectedAt(ojName, handle)
+                        ))
+                        .toList()
+        );
+        List<String> handles = collectionSnapshot.handles();
+        if (handles.isEmpty()) {
+            return OjSubmissionCollectionResult.withoutWrite(
+                    ojName,
+                    fallbackWindowStartInclusive,
+                    windowEndExclusive,
+                    0,
+                    List.of(),
+                    "No " + adapter.displayName(ojName) + " handles configured for collection"
+            );
+        }
+
+        List<OjHandleCollectionOutcome> matchedOutcomes = new ArrayList<>();
+        List<OjSubmissionCollectionHandleResult> handleResults = new ArrayList<>();
+        List<OjHandleCollectionOutcome> successfulOutcomes = new ArrayList<>();
+        Instant earliestWindowStartInclusive = null;
+        OjCollectionRequestExecutor requestExecutor = new OjCollectionRequestExecutor(
+                maxRequestAttempts,
+                requestInterval,
+                sleepStrategy
+        );
+        for (OjCollectionConsistencyGuard.CollectionTarget target : collectionSnapshot.targets()) {
+            String handle = target.handle();
+            Instant windowStartInclusive = collectionWindowStart(
+                    target.lastCollectedAt(),
+                    lookback,
+                    windowEndExclusive
+            );
+            if (earliestWindowStartInclusive == null || windowStartInclusive.isBefore(earliestWindowStartInclusive)) {
+                earliestWindowStartInclusive = windowStartInclusive;
+            }
+            OjHandleCollectionOutcome outcome = adapter.collectHandle(
+                    ojName,
+                    handle,
+                    windowStartInclusive,
+                    windowEndExclusive,
+                    requestExecutor
+            );
+            handleResults.add(outcome.result());
+            if (outcome.result().status() == OjSubmissionCollectionHandleStatus.SUCCESS) {
+                successfulOutcomes.add(outcome);
+                if (!outcome.submissions().isEmpty()) {
+                    matchedOutcomes.add(outcome);
+                }
+            }
+        }
+
+        Instant resultWindowStartInclusive = earliestWindowStartInclusive == null
+                ? fallbackWindowStartInclusive
+                : earliestWindowStartInclusive;
+        return consistencyGuard.withLockedHandles(
+                collectionSnapshot,
+                !successfulOutcomes.isEmpty(),
+                lockedHandles -> finalizeCollection(
+                ojName,
+                resultWindowStartInclusive,
+                windowEndExclusive,
+                handles,
+                handleResults,
+                successfulOutcomes,
+                matchedOutcomes,
+                lockedHandles
+        ));
+    }
+
+    private OjSubmissionCollectionResult finalizeCollection(
+            String ojName,
+            Instant resultWindowStartInclusive,
+            Instant windowEndExclusive,
+            List<String> requestedHandles,
+            List<OjSubmissionCollectionHandleResult> handleResults,
+            List<OjHandleCollectionOutcome> successfulOutcomes,
+            List<OjHandleCollectionOutcome> matchedOutcomes,
+            List<String> lockedHandles
+    ) throws JsonProcessingException {
+        List<OjSubmissionCollectionHandleResult> consistentHandleResults = handleResults.stream()
+                .map(result -> lockedHandles.contains(result.handle())
+                        ? result
+                        : OjSubmissionCollectionHandleResult.failed(
+                                result.handle(),
+                                result.fetchedSubmissionCount(),
+                                "OJ_HANDLE_BINDING_CHANGED",
+                                "OJ handle binding changed while submissions were being fetched; fetched data was discarded"
+                        ))
+                .toList();
+        List<OjHandleCollectionOutcome> consistentSuccessfulOutcomes = successfulOutcomes.stream()
+                .filter(outcome -> lockedHandles.contains(outcome.result().handle()))
+                .toList();
+        List<OjHandleCollectionOutcome> consistentMatchedOutcomes = matchedOutcomes.stream()
+                .filter(outcome -> lockedHandles.contains(outcome.result().handle()))
+                .toList();
+        int requestedHandleCount = requestedHandles.size();
+        if (consistentMatchedOutcomes.isEmpty()) {
+            markSuccessfulHandleCollections(ojName, consistentSuccessfulOutcomes, windowEndExclusive);
+            return OjSubmissionCollectionResult.withoutWrite(
+                    ojName,
+                    resultWindowStartInclusive,
+                    windowEndExclusive,
+                    requestedHandleCount,
+                    consistentHandleResults,
+                    "No " + adapter.displayName(ojName) + " submissions matched the collection window"
+            );
+        }
+
+        OjSubmissionCollectionWriteResult writeResult = adapter.writeBatch(ojName, consistentMatchedOutcomes);
+        markSuccessfulHandleCollections(ojName, consistentSuccessfulOutcomes, windowEndExclusive);
+        return OjSubmissionCollectionResult.written(
+                ojName,
+                resultWindowStartInclusive,
+                windowEndExclusive,
+                requestedHandleCount,
+                consistentHandleResults,
+                writeResult
+        );
+    }
+
+    private void markSuccessfulHandleCollections(
+            String ojName,
+            List<OjHandleCollectionOutcome> successfulOutcomes,
+            Instant collectedAt
+    ) {
+        for (OjHandleCollectionOutcome outcome : successfulOutcomes) {
+            handleResolver.markHandleCollected(
+                    ojName,
+                    outcome.result().handle(),
+                    collectedAt
+            );
+        }
+    }
+
+    private static Instant collectionWindowStart(
+            Instant lastCollectedAt,
+            Duration lookback,
+            Instant windowEndExclusive
+    ) {
+        if (lastCollectedAt == null) {
+            return Instant.EPOCH;
+        }
+        Instant effectiveLastCollectedAt = lastCollectedAt.isAfter(windowEndExclusive)
+                ? windowEndExclusive
+                : lastCollectedAt;
+        return overlapWindowStart(effectiveLastCollectedAt, lookback);
+    }
+
+    private static Instant overlapWindowStart(Instant referenceTime, Duration lookback) {
+        if (!referenceTime.isAfter(Instant.EPOCH)) {
+            return Instant.EPOCH;
+        }
+        Instant candidate = referenceTime.minus(lookback);
+        return candidate.isBefore(Instant.EPOCH) ? Instant.EPOCH : candidate;
+    }
+
+    private static List<String> normalizeHandles(List<String> handles) {
+        if (handles == null) {
+            return List.of();
+        }
+        return handles.stream()
+                .filter(Objects::nonNull)
+                .map(String::trim)
+                .filter(handle -> !handle.isBlank())
+                .distinct()
+                .toList();
+    }
+
+    private static void requireWindow(Instant windowStartInclusive, Instant windowEndExclusive) {
+        if (windowStartInclusive == null) {
+            throw new IllegalArgumentException("windowStartInclusive must not be null");
+        }
+        if (windowEndExclusive == null) {
+            throw new IllegalArgumentException("windowEndExclusive must not be null");
+        }
+        if (windowStartInclusive.isAfter(windowEndExclusive)) {
+            throw new IllegalArgumentException("windowStartInclusive must not be after windowEndExclusive");
+        }
+    }
+
+    private static Duration requireNonNegativeDuration(Duration value, String fieldName) {
+        if (value == null || value.isNegative()) {
+            throw new IllegalArgumentException(fieldName + " must not be negative");
+        }
+        return value;
+    }
+
+    private static String requireOjName(String value) {
+        return requireText(value, "ojName").toUpperCase(Locale.ROOT);
+    }
+
+    private interface CollectionHandleSupplier {
+        List<String> listHandles();
+    }
+}

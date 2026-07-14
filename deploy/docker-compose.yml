@@ -1,0 +1,84 @@
+services:
+  training-db:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      TZ: Asia/Shanghai
+      MYSQL_DATABASE: ${TRAINING_DB_NAME}
+      MYSQL_USER: ${TRAINING_DB_USERNAME}
+      MYSQL_PASSWORD: ${TRAINING_DB_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${TRAINING_DB_ROOT_PASSWORD}
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+    volumes:
+      - training-db-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+
+  training-api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    environment:
+      TZ: Asia/Shanghai
+      SERVER_PORT: 8190
+      SPRING_DATASOURCE_URL: jdbc:mysql://training-db:3306/${TRAINING_DB_NAME}?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Asia/Shanghai&allowPublicKeyRetrieval=true
+      SPRING_DATASOURCE_USERNAME: ${TRAINING_DB_USERNAME}
+      SPRING_DATASOURCE_PASSWORD: ${TRAINING_DB_PASSWORD}
+      TRAINING_OPERATION_PASSWORD: ${TRAINING_OPERATION_PASSWORD}
+      LOG_DIR: /app/logs
+      TRAINING_JOB_ITEM_INTERVAL: ${TRAINING_JOB_ITEM_INTERVAL:-4s}
+      TRAINING_DAILY_COLLECTION_LOOKBACK: ${TRAINING_DAILY_COLLECTION_LOOKBACK:-100h}
+      TRAINING_INTRADAY_COLLECTION_LOOKBACK: ${TRAINING_INTRADAY_COLLECTION_LOOKBACK:-0h}
+      TRAINING_CODEFORCES_DAILY_COLLECTION_ENABLED: ${TRAINING_CODEFORCES_DAILY_COLLECTION_ENABLED:-false}
+      TRAINING_CODEFORCES_INTRADAY_COLLECTION_ENABLED: ${TRAINING_CODEFORCES_INTRADAY_COLLECTION_ENABLED:-false}
+      TRAINING_ATCODER_DAILY_COLLECTION_ENABLED: ${TRAINING_ATCODER_DAILY_COLLECTION_ENABLED:-false}
+      TRAINING_ATCODER_INTRADAY_COLLECTION_ENABLED: ${TRAINING_ATCODER_INTRADAY_COLLECTION_ENABLED:-false}
+      TRAINING_ATCODER_PROBLEM_LIST_SCHEDULE_ENABLED: ${TRAINING_ATCODER_PROBLEM_LIST_SCHEDULE_ENABLED:-false}
+      TRAINING_ATCODER_PROBLEM_LIST_BOOTSTRAP_ENABLED: ${TRAINING_ATCODER_PROBLEM_LIST_BOOTSTRAP_ENABLED:-false}
+    ports:
+      - "127.0.0.1:${BACKEND_PORT:-8190}:8190"
+    volumes:
+      - training-api-logs:/app/logs
+    depends_on:
+      training-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8190/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    init: true
+    ports:
+      - "${FRONTEND_BIND_ADDRESS:-127.0.0.1}:${FRONTEND_PORT:-3100}:80"
+    depends_on:
+      training-api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget -q -O - http://127.0.0.1/ >/dev/null && wget -q -O - http://127.0.0.1/api/health >/dev/null || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+volumes:
+  training-db-data:
+    name: ${TRAINING_DB_VOLUME_NAME:-oj-training-data-manager_training-db-data}
+  training-api-logs:
+    name: ${TRAINING_LOG_VOLUME_NAME:-oj-training-data-manager_training-api-logs}
